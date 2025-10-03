@@ -1,0 +1,55 @@
+Plan de Pruebas — Secadora de Café con ESP32
+Objetivo: Verificar el correcto funcionamiento de los sensores, actuadores y lógica de control implementada en la secadora de café.
+
+Prueba 1: Lectura de Sensores de Temperatura y Humedad
+Descripción: Validar que los sensores DS18B20 (interior) y DHT22 (exterior) entreguen valores correctos.
+Procedimiento:
+Energizar el sistema con los sensores conectados.
+Observar la salida por Serial y/o interfaz web /api/last.
+Comparar las lecturas con un termómetro/higrómetro de referencia.
+Resultado esperado:
+El DS18B20 reporta una temperatura en el rango válido (–55 a 125 °C).
+El DHT22 reporta temperatura (–40 a 80 °C) y humedad (0–100%).
+El JSON expuesto muestra datos no nulos ("t_ds18": xx.xx, "t_dht": xx.xx, "h_dht": yy.yy).
+
+Prueba 2: Control del Peltier (Histéresis)
+Descripción: Verificar que el módulo Peltier se active/desactive según el setpoint configurado (T_SET_C = 45 °C).
+Procedimiento:
+Simular una temperatura interior baja (ejemplo: 40 °C).
+Observar por Serial o interfaz web el valor "duty".
+Elevar la temperatura simulada por encima de 47 °C (setpoint + histéresis).
+Resultado esperado:
+Si Tin < 43.5 °C, el duty sube a 255 (100%).
+Si Tin > 46.5 °C, el duty baja a 0 (apagado).
+Se observa el cambio de estado en consola y en la interfaz web.
+
+Prueba 3: Movimiento del Servo
+Descripción: Verificar el movimiento oscilante del servo que controla la malla.
+Procedimiento:
+Energizar el sistema.
+Observar visualmente el movimiento del servo.
+Revisar el valor "servo" en el JSON de /api/last.
+Resultado esperado:
+El servo oscila entre 30° y 150° en pasos de 5°.
+El valor reportado en la interfaz coincide con la posición real.
+
+Prueba 4: Alarmas (LED/Buzzer)
+Descripción: Validar la activación de la alarma visual cuando hay condiciones críticas.
+Procedimiento:
+Elevar la temperatura interior por encima de 50 °C o humedad > 85%.
+Observar el LED de alarma conectado al pin definido.
+Resultado esperado:
+El LED se enciende en condiciones fuera de rango.
+El estado cambia en tiempo real al normalizar los valores.
+
+Prueba 5: Comunicación Web/HTTP
+Descripción: Validar que el sistema exponga datos a través del servidor web y realice POST al endpoint configurado.
+Procedimiento:
+Conectar el ESP32 a Wi-Fi.
+Acceder a la IP local (http://<ip>/).
+Consultar el endpoint /api/last.
+Revisar en el servidor remoto si se reciben POST cada 10 minutos.
+Resultado esperado:
+La página HTML muestra en tiempo real los valores de temperatura, humedad, duty y servo.
+El endpoint /api/last devuelve JSON válido con los campos esperados.
+El servidor remoto recibe los promedios (JSON con Tin, Tamb, H).
