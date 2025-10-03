@@ -1,4 +1,4 @@
-#  Secador de Café Inteligente con ESP32
+# ☕️ Secador de Café Inteligente con ESP32
 
 Proyecto desarrollado en **ESP32** para el control automatizado de un **secador de café**.  
 El sistema utiliza sensores de humedad y temperatura, control de potencia con una celda Peltier, servomotores y un reloj de tiempo real (RTC) para registrar datos con timestamp.  
