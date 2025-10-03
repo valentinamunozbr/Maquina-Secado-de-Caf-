@@ -1,0 +1,644 @@
+/**
+ * @file Secador_Cafe_Doxygen.cpp
+ * @brief Secador de Café (ESP32) con documentación Doxygen.
+ *
+ * Este archivo contiene la implementación del sistema de secado de café
+ * usando un ESP32. Incluye la lectura de sensores (DS18B20 y DHT22),
+ * control de temperatura mediante un módulo Peltier (PWM), movimiento de
+ * una malla mediante un servomotor, RTC para timestamps, servidor web
+ * local y envíos periódicos de promedios a un endpoint remoto.
+ *
+ * La documentación con Doxygen describe las estructuras, variables globales,
+ * funciones y tareas FreeRTOS para facilitar la generación de la documentación
+ * técnica y el entendimiento del sistema.
+ *
+ * @author Juan Jose Gomez, Cesar Guerrero, Valentina Muñoz, Sara Sanchez
+ * @date 2025-10-02
+ * @version 1.1
+ *
+ */
+
+#include <Arduino.h>
+#include <esp32-hal-ledc.h>
+#include <driver/ledc.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <RTClib.h>
+#include <time.h>
+#include <RunningAverage.h>
+#include <ESP32Servo.h>
+#include <DHT.h>
+#include <esp_sleep.h>    // para light sleep
+
+/** @defgroup WIFI Endpoint Wi-Fi y HTTP
+ *  @brief Configuración de red y URL de envío.
+ *  @{ */
+const char* WIFI_SSID      = "TU_SSID";                 /< SSID Wi‑Fi (MODIFICAR) */
+const char* WIFI_PASS      = "TU_PASSWORD";             /< Password Wi‑Fi (MODIFICAR) */
+const char* HTTP_POST_URL  = "http://tu-servidor.com/mediciones/promedio"; /< URL opcional para POST */
+/** @} */
+
+/** @defgroup TZ Zona horaria y NTP
+ *  @brief Parámetros NTP y offset de zona.
+ *  @{ */
+static const long   GMT_OFFSET_SEC = -5 * 3600;           /< Offset GMT (ej: Colombia -5) */
+static const int    DST_OFFSET_SEC = 0;                   /< DST si aplica */
+static const char*  NTP1 = "pool.ntp.org";              /< NTP primario */
+static const char*  NTP2 = "time.nist.gov";             /< NTP secundario */
+/** @} */
+
+/** @defgroup PINES Pines de hardware
+ *  @brief Pines usados por sensores y actuadores.
+ *  @{ */
+#define PIN_ONEWIRE   4    /< Pin OneWire (DS18B20, sensor interno) */
+#define PIN_DHT       5    /< Pin DHT22 (sensor ambiente) */
+#define PIN_PELTIER  23    /< Pin PWM hacia driver Peltier */
+#define PIN_SERVO    18    /< Pin del servo para la malla */
+#define PIN_LED_ALARMA 2   /< LED indicador de alarma (visual) */
+/** @} */
+
+// ================== SENSORES / PERIFERICOS ==================
+OneWire oneWire(PIN_ONEWIRE);            /< Interfaz OneWire para DS18B20 */
+DallasTemperature ds18b20(&oneWire);    /< Driver DallasTemperature */
+RTC_DS1307 rtc;                         /< RTC (DS1307 usado aquí) */
+
+#define DHTTYPE DHT22
+DHT dht(PIN_DHT, DHTTYPE);              /< Instancia DHT22 */
+
+// ================== SERVO ==================
+Servo meshServo;                         /< Servo que mueve la malla */
+int SERVO_MIN_DEG  = 30;                 /< Posición mínima (grados) */
+int SERVO_MAX_DEG  = 150;                /< Posición máxima (grados) */
+int SERVO_STEP_DEG = 5;                  /< Paso en grados por iteración */
+uint32_t SERVO_STEP_MS = 200;            /< Retardo entre pasos (ms) */
+int servoPos = SERVO_MIN_DEG;            /< Posición actual del servo */
+int servoDir = +1;                       /< Sentido de movimiento: +1/-1 */
+
+// ================== PWM PELTIER ==================
+const int LEDC_CHANNEL  = 0;             /< Canal LEDC usado */
+const int LEDC_FREQ_HZ  = 5000;          /< Frecuencia PWM */
+const int LEDC_RES_BITS = 8;             /< Resolución (bits) -> duty 0..255 */
+uint8_t peltierDuty     = 0;             /< Duty actual (0..255) */
+
+// ================== FreeRTOS IPC ==================
+static TaskHandle_t hSensorTask   = nullptr; /< Handle tarea sensores */
+static TaskHandle_t hControlTask  = nullptr; /< Handle tarea control */
+static TaskHandle_t hLoggerTask   = nullptr; /< Handle tarea logger */
+static TaskHandle_t hSenderTask   = nullptr; /< Handle tarea sender/web */
+static TaskHandle_t hServoTask    = nullptr; /< Handle tarea servo */
+
+static QueueHandle_t qSensors     = nullptr; /< Cola para pasar SensorFrame */
+static SemaphoreHandle_t semCtrl  = nullptr; /< Semáforo binario para tick de control */
+static SemaphoreHandle_t snapMtx  = nullptr; /< Mutex para proteger snapshot global */
+
+// ================== Timer HW ==================
+hw_timer_t* ctrlTimer = nullptr;          /< Timer hardware para ticks de control */
+
+// ================== Parámetros de control ==================
+float    T_SET_C          = 45.0f;        /< Setpoint de temperatura interna (°C) */
+float    T_HYST_C         = 1.5f;         /< Banda de histéresis (°C) */
+uint8_t  HEAT_FULL_DUTY   = 255;          /< Duty al encender calefacción */
+
+// Ritmos de sensado
+uint32_t DS18_PERIOD_MS   = 10000;        /< Periodo de lectura DS18B20 (ms) */
+uint32_t DHT_PERIOD_MS    = 60000;        /< Periodo de lectura DHT22 (ms) */
+
+// Tick de control
+uint32_t CTRL_TICK_MS     = 30000;        /< Periodo de control (ms) */
+
+// Transmisión / ventana Web
+uint32_t TX_PERIOD_S      = 600;          /< Periodo de envío de promedios (s) */
+uint32_t TX_WINDOW_MS     = 8000;         /< Ventana en la que el servidor atiende (ms) */
+
+/** @brief Estructura que almacena una muestra de sensores. */
+struct SensorFrame {
+  uint32_t ts;     /< Timestamp (epoch, s) */
+  float t_ds18;    /< Temperatura interna (DS18B20) en °C */
+  float t_dht;     /< Temperatura ambiente (DHT22) en °C */
+  float h_dht;     /< Humedad relativa (%) */
+  bool  valid_ds18;/< Flag: lectura DS18 válida */
+  bool  valid_dht; /< Flag: lectura DHT válida */
+};
+
+static SensorFrame gSnap = {};            /< Snapshot protegida para web */
+static uint8_t     gSnapDuty = 0;        /< Duty snapshot */
+static int         gSnapServo = 0;       /< Posición servo snapshot */
+
+// ================== Promedios (10 min) ==================
+RunningAverage avg_Tint(120);            /< Promedio móvil para Tin */
+RunningAverage avg_Tamb(20);             /< Promedio para Tamb */
+RunningAverage avg_H(20);                /< Promedio humedad */
+uint32_t avg_last_ts = 0;                /< Timestamp de última muestra para promedios */
+
+// ================== HTTP Server (UI) ==================
+WebServer server(80);
+
+static const char INDEX_HTML[] PROGMEM = R"HTML(
+<!doctype html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Secador de Café</title>
+<style>
+body{font-family:system-ui,Segoe UI,Roboto,Arial,sans-serif;margin:16px}
+.card{border:1px solid #ddd;border-radius:12px;padding:16px;margin-bottom:12px;box-shadow:0 2px 8px rgba(0,0,0,.05)}
+.row{display:flex;gap:12px;flex-wrap:wrap}.box{flex:1 1 220px;border:1px solid #eee;border-radius:10px;padding:12px}
+.label{color:#666}.value{font-size:1.5rem;margin-top:4px}.on{color:#0b78ff}.off{color:#999}small{color:#666}
+</style></head><body>
+<h1>Secador de Café — Monitoreo</h1>
+<div class="card"><div class="row">
+  <div class="box"><div class="label">Temp café (DS18B20)</div><div id="t_ds18" class="value">— °C</div></div>
+  <div class="box"><div class="label">Temp aire (DHT22)</div><div id="t_dht" class="value">— °C</div></div>
+  <div class="box"><div class="label">Humedad aire (DHT22)</div><div id="h_dht" class="value">— %</div></div>
+  <div class="box"><div class="label">Peltier duty</div><div id="duty" class="value">— %</div></div>
+  <div class="box"><div class="label">Servo malla</div><div id="servo" class="value">— °</div></div>
+</div><div style="margin-top:8px"><small id="ts">—</small></div></div>
+<script>
+async function refresh(){
+  try{
+    const r = await fetch('/api/last',{cache:'no-store'}); if(!r.ok) return;
+    const j = await r.json(); const f=v=>v==null||Number.isNaN(v)?'—':(Math.round(v*100)/100);
+    t_ds18.textContent = f(j.t_ds18)+' °C';
+    t_dht.textContent  = f(j.t_dht) +' °C';
+    h_dht.textContent  = f(j.h_dht) +' %';
+    duty.textContent   = (j.duty!=null)? (Math.round(j.duty*100)/100)+' %' : '— %';
+    servo.textContent  = (j.servo!=null)? (j.servo+' °') : '— °';
+    ts.textContent     = j.ts?('Última muestra: '+new Date(j.ts*1000).toLocaleString()):'—';
+  }catch(e){}
+}
+refresh(); setInterval(refresh, 2000);
+</script></body></html>
+)HTML";
+
+/**
+ * @brief Calcula un checksum simple (XOR) sobre los bytes de una cadena.
+ * @param s Cadena de la que se calcula el checksum.
+ * @return Checksum (uint8_t) — XOR simple de todos los bytes.
+ * @note Usado para una validación simple de la trama en Serial (no es criptográfico).
+ */
+static uint8_t simple_xor_checksum(const String &s) {
+  uint8_t x = 0;
+  for (size_t i = 0; i < s.length(); ++i) x ^= (uint8_t)s[i];
+  return x;
+}
+
+/**
+ * @brief Construye el JSON que sirve en /api/last con la última snapshot.
+ * @return String JSON con campos ts,t_ds18,t_dht,h_dht,duty,servo (null cuando no existe).
+ */
+String jsonLast() {
+  SensorFrame s;
+  uint8_t duty;
+  int sdeg;
+
+  if (snapMtx && xSemaphoreTake(snapMtx, pdMS_TO_TICKS(50)) == pdTRUE) {
+    s = gSnap;
+    duty = gSnapDuty;
+    sdeg = gSnapServo;
+    xSemaphoreGive(snapMtx);
+  } else {
+    s = {};
+    duty = 0;
+    sdeg = 0;
+  }
+
+  auto f = [](float v) -> String {
+    if (isnan(v)) return "null";
+    char b[24];
+    dtostrf(v, 0, 2, b);      // 2 decimales
+    String sv(b);
+    sv.replace(" ", "");      // quita espacios que deja dtostrf
+    return sv;
+  };
+
+  String j;
+  j.reserve(200);
+
+  j += '{';
+  j += "\"ts\":";
+  j += String(s.ts ? s.ts : 0);
+  j += ',';
+  j += "\"t_ds18\":";
+  j += (s.valid_ds18 ? f(s.t_ds18) : "null");
+  j += ',';
+  j += "\"t_dht\":";
+  j += (s.valid_dht ? f(s.t_dht) : "null");
+  j += ',';
+  j += "\"h_dht\":";
+  j += (s.valid_dht ? f(s.h_dht) : "null");
+  j += ',';
+  j += "\"duty\":";
+  j += String((100.0f * duty) / 255.0f, 1);
+  j += ',';
+  j += "\"servo\":";
+  j += String(sdeg);
+  j += '}';
+
+  return j;
+}
+
+/** @brief Handler para la ruta raíz (página HTML). */
+void handleIndex(){ server.send(200,"text/html; charset=utf-8",INDEX_HTML); }
+/** @brief Handler para /api/last — devuelve JSON con la última muestra. */
+void handleApiLast(){ server.send(200,"application/json",jsonLast()); }
+
+// ================== Helpers ==================
+/**
+ * @brief Ajusta el duty del Peltier y actualiza la variable global.
+ * @param duty Valor 0..255 para el ciclo de trabajo.
+ */
+static void peltier_setDuty(uint8_t duty){ peltierDuty = duty; ledcWrite(LEDC_CHANNEL, duty); }
+
+/**
+ * @brief ISR del timer de control — da el semáforo de control.
+ * @note Esta función está marcada IRAM_ATTR porque se invoca desde ISR.
+ */
+void IRAM_ATTR onCtrlTimer(){ BaseType_t hpw=pdFALSE; xSemaphoreGiveFromISR(semCtrl,&hpw); if(hpw) portYIELD_FROM_ISR(); }
+
+/**
+ * @brief Intenta conectar a la red Wi‑Fi configurada.
+ * @return true si se conectó correctamente dentro del timeout (15s), false en caso contrario.
+ */
+bool wifiConnect(){
+  WiFi.mode(WIFI_STA); WiFi.begin(WIFI_SSID, WIFI_PASS);
+  uint32_t t0=millis(); Serial.print("Wi-Fi conectando");
+  while(WiFi.status()!=WL_CONNECTED && millis()-t0<15000){ Serial.print("."); delay(250); }
+  Serial.println();
+  if(WiFi.status()==WL_CONNECTED){ Serial.print("Wi-Fi IP: "); Serial.println(WiFi.localIP()); return true; }
+  Serial.println("Wi-Fi FAIL"); return false;
+}
+
+/** @brief Desconecta y apaga el Wi‑Fi (ahorro energético). */
+void wifiOff(){ WiFi.disconnect(true); WiFi.mode(WIFI_OFF); }
+
+/**
+ * @brief Sincroniza la hora vía NTP una vez y ajusta el RTC si está presente.
+ * @return true si se obtuvo hora válida, false si falló.
+ */
+bool ntpSyncOnce(){
+  if(!wifiConnect()) return false;
+  configTime(GMT_OFFSET_SEC, DST_OFFSET_SEC, NTP1, NTP2);
+  time_t now=0; uint32_t t1=millis();
+  do{ now=time(nullptr); delay(200);}while(now<1577836800 && millis()-t1<8000);
+  if(now<1577836800){ Serial.println("NTP FAIL"); return false; }
+  if(rtc.begin()){
+    struct tm* tm_now = localtime(&now);
+    DateTime dt(1900+tm_now->tm_year, tm_now->tm_mon+1, tm_now->tm_mday,
+                tm_now->tm_hour, tm_now->tm_min, tm_now->tm_sec);
+    rtc.adjust(dt);
+  }
+  return true;
+}
+
+// ================== Variables de estabilidad / gestión de potencia ==================
+static float last_log_temp = NAN;  /< Última temperatura válida registrada para estabilidad */
+static float last_log_hum  = NAN;  /< Última humedad válida registrada para estabilidad */
+static int stable_count = 0;       /< Contador de logs consecutivos estables */
+const int STABLE_REQUIRED = 3;     /< Requeridos logs consecutivos para considerar estable */
+const float STABLE_DELTA_T = 0.5;  /< Delta temperature para estabilidad (°C) */
+const float STABLE_DELTA_H = 1.0;  /< Delta humidity para estabilidad (%RH) */
+
+// ================== TAREAS (FreeRTOS) ==================
+
+/**
+ * @brief Tarea que lee sensores DS18B20 y DHT22 periódicamente.
+ *
+ * - DS18B20: requestTemperatures() seguido de un vTaskDelay(750 ms)
+ *   para asegurar la conversión (12-bit ≈ 750 ms).
+ * - DHT22: lectura con validación de rango.
+ * - Actualiza promedios RunningAverage y empuja la muestra a la cola qSensors.
+ *
+ * @param[in] Unused pvParameters (NULL).
+ */
+void SensorTask(void*){
+  TickType_t lastDS  = xTaskGetTickCount();
+  TickType_t lastDHT = xTaskGetTickCount();
+
+  for(;;){
+    SensorFrame frame{};
+    bool sent=false;
+
+    // Timestamp fallback: si RTC no tiene tiempo válido, usamos time() o millis()
+    DateTime now = rtc.now();
+    uint32_t ts_now = now.unixtime();
+    if (ts_now < 1577836800U) {
+      time_t tnow = time(nullptr);
+      if (tnow >= 1577836800) ts_now = (uint32_t)tnow;
+      else ts_now = millis()/1000;
+    }
+    frame.ts = ts_now;
+
+    // DS18B20 (Tin) - asegurar conversión
+    if(xTaskGetTickCount() - lastDS >= pdMS_TO_TICKS(DS18_PERIOD_MS)){
+      ds18b20.requestTemperatures();            // inicia conversión
+      vTaskDelay(pdMS_TO_TICKS(750));           // esperar conversión (~750ms)
+      float t = ds18b20.getTempCByIndex(0);
+      if(isnan(t)==false && t>-55 && t<125){
+        frame.t_ds18=t; frame.valid_ds18=true;
+        avg_Tint.addValue(t);
+        avg_last_ts = frame.ts;
+      } else {
+        frame.valid_ds18 = false;
+      }
+      lastDS = xTaskGetTickCount(); sent=true;
+    }
+
+    // DHT22 (Tamb, H)
+    if(xTaskGetTickCount() - lastDHT >= pdMS_TO_TICKS(DHT_PERIOD_MS)){
+      float h=dht.readHumidity();
+      float ta=dht.readTemperature();
+      if(!isnan(h) && !isnan(ta) && ta>-40 && ta<80 && h>=0 && h<=100){
+        frame.t_dht=ta; frame.h_dht=h; frame.valid_dht=true;
+        avg_Tamb.addValue(ta);
+        avg_H.addValue(h);
+        avg_last_ts = frame.ts;
+      } else {
+        frame.valid_dht = false;
+      }
+      lastDHT = xTaskGetTickCount(); sent=true;
+    }
+
+    if(sent){
+      if(qSensors) xQueueOverwrite(qSensors,&frame);
+      if(hLoggerTask) xTaskNotifyGive(hLoggerTask);
+    }
+    vTaskDelay(pdMS_TO_TICKS(150));
+  }
+}
+
+/**
+ * @brief Tarea de control: espera semáforo de control y ajusta Peltier.
+ *
+ * - Lee la última muestra desde qSensors (si hay) y aplica la lógica de
+ *   histéresis sobre Tin para encender/apagar Peltier.
+ *
+ * @param[in] Unused pvParameters (NULL).
+ */
+void ControlTask(void*){
+  SensorFrame cur{};
+  for(;;){
+    xSemaphoreTake(semCtrl, portMAX_DELAY);
+
+    SensorFrame rx;
+    if(xQueueReceive(qSensors,&rx,0)==pdPASS){
+      if(rx.valid_ds18) cur.t_ds18 = rx.t_ds18;
+      if(rx.ts)         cur.ts = rx.ts;
+    }
+
+    float Tin = cur.t_ds18;
+    if(!isnan(Tin)){
+      if(Tin < (T_SET_C - T_HYST_C)){
+        peltier_setDuty(HEAT_FULL_DUTY);
+      } else if (Tin > (T_SET_C + T_HYST_C)){
+        peltier_setDuty(0);
+      }
+    }
+    if(hLoggerTask) xTaskNotifyGive(hLoggerTask);
+  }
+}
+
+/**
+ * @brief Tarea de logging: compone la trama serial y gestiona alarmas/consumo.
+ *
+ * - Obtiene la última muestra con xQueuePeek, actualiza gSnap y genera una
+ *   línea formateada para Serial que incluye STATUS, mediciones y CSUM.
+ * - Activa LED de alarma si se detectan condiciones peligrosas.
+ * - Implementa un contador de estabilidad para entrar en light sleep cuando
+ *   las medidas sean estables.
+ *
+ * @param[in] Unused pvParameters (NULL).
+ */
+void LoggerTask(void*){
+  for(;;){
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    SensorFrame s{};
+    if(xQueuePeek(qSensors,&s,0)==pdPASS){
+      if(snapMtx && xSemaphoreTake(snapMtx,pdMS_TO_TICKS(20))==pdTRUE){
+        gSnap=s; gSnapDuty=peltierDuty; gSnapServo=servoPos;
+        xSemaphoreGive(snapMtx);
+      }
+
+      // Obtener hora (fallback si RTC no tiene hora válida)
+      DateTime dt = rtc.now();
+      time_t tnow = dt.unixtime();
+      if (tnow < 1577836800U) {
+        time_t w = time(nullptr);
+        if (w >= 1577836800) tnow = w;
+        else tnow = millis()/1000;
+      }
+      struct tm tm_now;
+      gmtime_r(&tnow, &tm_now); // UTC
+
+      // Validación y formateo con STATUS
+      String statusLine;
+      statusLine.reserve(160);
+      char timebuf[32];
+      snprintf(timebuf, sizeof(timebuf), "[%04d-%02d-%02d %02d:%02d:%02d]",
+               tm_now.tm_year+1900, tm_now.tm_mon+1, tm_now.tm_mday,
+               tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+
+      if (!s.valid_ds18 && !s.valid_dht) {
+        statusLine = String(timebuf) + " STATUS:ERR_SENSORS";
+        Serial.println(statusLine);
+      } else {
+        // Build payload textual
+        String payload = "";
+        payload.reserve(128);
+        payload += String(timebuf);
+        payload += " STATUS:OK;";
+        if (s.valid_ds18) { payload += "Tin:" + String(s.t_ds18,2) + "C;"; }
+        else             { payload += "Tin:ERR;"; }
+        if (s.valid_dht)  { payload += "Tamb:" + String(s.t_dht,2) + "C;H:" + String(s.h_dht,1) + "%;"; }
+        else              { payload += "Tamb:ERR;H:ERR;"; }
+        payload += "Duty:" + String(peltierDuty) + ";Servo:" + String(servoPos);
+
+        // checksum simple (XOR)
+        uint8_t csum = simple_xor_checksum(payload);
+        payload += ";CSUM:0x";
+        char hexbuf[5];
+        snprintf(hexbuf, sizeof(hexbuf), "%02X", csum);
+        payload += String(hexbuf);
+
+        Serial.println(payload);
+
+        // Lógica para alarmas visuales (LED)
+        bool alarm = false;
+        if (s.valid_ds18 && s.t_ds18 > (T_SET_C + 5.0f)) alarm = true; // umbral de ejemplo
+        if (s.valid_dht && s.h_dht > 85.0f) alarm = true;
+
+        digitalWrite(PIN_LED_ALARMA, alarm ? HIGH : LOW);
+
+        // Gestión de potencia: comprobamos estabilidad respecto al último log
+        if (s.valid_ds18 && s.valid_dht) {
+          float t = s.t_ds18;
+          float h = s.h_dht;
+          if (!isnan(last_log_temp) && !isnan(last_log_hum)) {
+            if (fabs(t - last_log_temp) < STABLE_DELTA_T && fabs(h - last_log_hum) < STABLE_DELTA_H) {
+              stable_count++;
+            } else stable_count = 0;
+          } else {
+            stable_count = 0;
+          }
+          last_log_temp = t;
+          last_log_hum  = h;
+
+          if (stable_count >= STABLE_REQUIRED) {
+            // Entrar en light sleep breve (ej: 10 s)
+            Serial.println("Condiciones estables -> Light sleep 10s");
+            esp_sleep_enable_timer_wakeup(10 * 1000000ULL); // 10 s
+            esp_light_sleep_start();
+            // cuando despierta, continuar normalmente
+            stable_count = 0; // reset contador
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * @brief Tarea que realiza el barrido del servo (malla) entre rangos.
+ *
+ * @param[in] Unused pvParameters (NULL).
+ */
+void ServoTask(void*){
+  for(;;){
+    servoPos += servoDir * SERVO_STEP_DEG;
+    if(servoPos >= SERVO_MAX_DEG){ servoPos = SERVO_MAX_DEG; servoDir = -1; }
+    if(servoPos <= SERVO_MIN_DEG){ servoPos = SERVO_MIN_DEG; servoDir = +1; }
+    meshServo.write(servoPos);
+    vTaskDelay(pdMS_TO_TICKS(SERVO_STEP_MS));
+  }
+}
+
+/**
+ * @brief Tarea encargada del envío de promedios y de abrir la ventana Web.
+ *
+ * - Conecta a Wi‑Fi, sincroniza NTP si es necesario, arranca server.begin()
+ *   durante TX_WINDOW_MS y atiende clientes con server.handleClient().
+ * - Genera JSON con promedios y opcionalmente POSTea a HTTP_POST_URL.
+ *
+ * @param[in] Unused pvParameters (NULL).
+ */
+void SenderTask(void*){
+  uint32_t lastTx_ms = millis();
+  static bool ntpDone=false;
+  for(;;){
+    uint32_t now=millis(), elapsed=now-lastTx_ms;
+    uint32_t wait_ms=(TX_PERIOD_S*1000>elapsed)?(TX_PERIOD_S*1000-elapsed):0;
+    vTaskDelay(pdMS_TO_TICKS(wait_ms));
+    lastTx_ms = millis();
+
+    if(!wifiConnect()) continue;
+    if(!ntpDone){ if(ntpSyncOnce()) ntpDone=true; }
+
+    // server.begin() arranca la escucha localmente
+    server.begin();
+    Serial.println("HTTP local: http://"+WiFi.localIP().toString());
+
+    // Promedios
+    size_t nTin=avg_Tint.getCount(), nTam=avg_Tamb.getCount(), nH=avg_H.getCount();
+    if(nTin+nTam+nH>0){
+      float mTin=(nTin>0)?avg_Tint.getAverage():NAN;
+      float mTam=(nTam>0)?avg_Tamb.getAverage():NAN;
+      float mH  =(nH  >0)?avg_H.getAverage():NAN;
+      uint32_t tsSend=(avg_last_ts>0)?avg_last_ts:(uint32_t)(time(nullptr));
+
+      String payload="{";
+      payload+="\"ts\":"+String(tsSend)+",";
+      payload+="\"Tin\":"+String(mTin,2)+",";
+      payload+="\"Tamb\":"+String(mTam,2)+",";
+      payload+="\"H\":"+String(mH,2);
+      payload+="}";
+
+      // POST opcional (si HTTP_POST_URL está configurada)
+      HTTPClient http;
+      http.begin(HTTP_POST_URL);
+      http.addHeader("Content-Type","application/json");
+      int code=http.POST((uint8_t*)payload.c_str(),payload.length());
+      Serial.printf("POST promedio -> code=%d, payload=%s\n",code,payload.c_str());
+      http.end();
+
+      // Reset acumuladores
+      avg_Tint.clear(); avg_Tamb.clear(); avg_H.clear();
+      avg_last_ts=0;
+    }
+
+    // Ventana web breve
+    uint32_t t0=millis();
+    while(millis()-t0 < TX_WINDOW_MS){
+      server.handleClient();
+      vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    server.stop();
+    wifiOff();
+    Serial.println("Ventana cerrada (Wi-Fi OFF).");
+  }
+}
+
+// ================== SETUP / LOOP ==================
+/**
+ * @brief Inicialización del sistema: periféricos, timers, colas y tareas.
+ */
+void setup(){
+  Serial.begin(115200); delay(200);
+  Serial.println("CoffeeDryer FreeRTOS (DS18 adentro + DHT22 afuera + Servo + Peltier + RunningAverage)");
+
+  // PWM Peltier
+  ledcSetup(LEDC_CHANNEL, LEDC_FREQ_HZ, LEDC_RES_BITS);
+  ledcAttachPin(PIN_PELTIER, LEDC_CHANNEL);
+  peltier_setDuty(0);
+
+  // Servo
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  meshServo.setPeriodHertz(50);
+  meshServo.attach(PIN_SERVO, 500, 2400);
+  meshServo.write(servoPos);
+
+  // Sensores
+  ds18b20.begin();
+  dht.begin();
+
+  // I2C + RTC
+  Wire.begin(); // SDA=21, SCL=22 por defecto
+  if(!rtc.begin()){ Serial.println("RTC no detectado. Continuo con millis()/NTP."); }
+
+  // Preparar pines adicionales
+  pinMode(PIN_LED_ALARMA, OUTPUT);
+  digitalWrite(PIN_LED_ALARMA, LOW);
+
+  // RTOS IPC
+  qSensors = xQueueCreate(1, sizeof(SensorFrame));
+  semCtrl  = xSemaphoreCreateBinary();
+  snapMtx  = xSemaphoreCreateMutex();
+
+  // Timer HW: configuración CORRECTA (prescaler 80 => 1 MHz ticks)
+  ctrlTimer = timerBegin(0, 80, true); // timer 0, prescaler 80 -> 1MHz
+  timerAttachInterrupt(ctrlTimer, &onCtrlTimer, true);
+  timerAlarmWrite(ctrlTimer, (uint64_t)CTRL_TICK_MS * 1000ULL, true); // valor en us
+  timerAlarmEnable(ctrlTimer);
+
+  // Registrar rutas del servidor solo UNA VEZ
+  server.on("/", handleIndex);
+  server.on("/api/last", handleApiLast);
+
+  // Tareas
+  xTaskCreatePinnedToCore(SensorTask, "SensorTask", 4096, nullptr, 2, &hSensorTask, 1);
+  xTaskCreatePinnedToCore(ControlTask,"ControlTask",4096, nullptr, 3, &hControlTask, 0);
+  xTaskCreatePinnedToCore(LoggerTask, "LoggerTask", 4096, nullptr, 1, &hLoggerTask, 1);
+  xTaskCreatePinnedToCore(ServoTask,  "ServoTask",  4096, nullptr, 1, &hServoTask,  1);
+  xTaskCreatePinnedToCore(SenderTask, "SenderTask", 4096, nullptr, 1, &hSenderTask, 1);
+
+  Serial.println("Sistema iniciado.");
+}
+
+/** @brief Loop vacío: todo se maneja por FreeRTOS. */
+void loop(){ 
+  vTaskDelay(portMAX_DELAY); 
+}
